@@ -6,6 +6,7 @@ require (
 	github.com/ethereum/go-ethereum v1.16.1
 	github.com/gorilla/websocket v1.5.3
 	github.com/sirupsen/logrus v1.9.3
+	github.com/vmihailenco/msgpack/v5 v5.4.1
 )
 
 require (
@@ -18,6 +19,7 @@ require (
 	github.com/ethereum/go-verkle v0.2.2 // indirect
 	github.com/holiman/uint256 v1.3.2 // indirect
 	github.com/supranational/blst v0.3.14 // indirect
+	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	golang.org/x/crypto v0.36.0 // indirect
 	golang.org/x/sync v0.12.0 // indirect
 	golang.org/x/sys v0.31.0 // indirect

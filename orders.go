@@ -3,21 +3,16 @@ package hyperliquid
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/ethereum/go-ethereum/common/math"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/common/hexutil"
-	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/signer/core/apitypes"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -32,32 +27,39 @@ const (
 	StatusUnknown OrderStatusPac = "unknown"
 )
 
-type PlaceOrderAction struct {
-	Grouping string         `json:"grouping"`
-	Orders   []OrderPayload `json:"orders"`
-	Type     string         `json:"type"`
+type Tif string
+
+const (
+	TifGtc Tif = "Gtc"
+	TifIoc Tif = "Ioc"
+	TifAlo Tif = "Alo"
+)
+
+const GroupingNA = "na"
+
+type OrderType struct {
+	Limit   *LimitOrderType   `json:"limit,omitempty"`
+	Trigger *TriggerOrderType `json:"trigger,omitempty"`
 }
 
 type LimitOrderType struct {
-	Tif string `json:"tif"`
+	Tif string `json:"tif"` // TifAlo, TifIoc, TifGtc
 }
 
-type MarketOrderType struct {
-	Tif string `json:"tif"`
+type TriggerOrderType struct {
+	TriggerPx string `json:"triggerPx"`
+	IsMarket  bool   `json:"isMarket"`
+	Tpsl      string `json:"tpsl"` // "tp" or "sl"
 }
 
-type OrderTypeData struct {
-	Limit  *LimitOrderType  `json:"limit,omitempty"`
-	Market *MarketOrderType `json:"market,omitempty"`
-}
-
-type OrderPayload struct {
-	Asset      int           `json:"a"`
-	IsBuy      bool          `json:"b"`
-	LimitPx    string        `json:"p"`
-	ReduceOnly bool          `json:"r"` // Moved up
-	Sz         string        `json:"s"` // Moved down
-	OrderType  OrderTypeData `json:"t"`
+type internalOrderRequest struct {
+	Asset         int       `json:"a"`
+	IsBuy         bool      `json:"b"`
+	Price         string    `json:"p"`
+	Size          string    `json:"s"`
+	ReduceOnly    bool      `json:"r"`
+	OrderType     OrderType `json:"t"`
+	ClientOrderID *string   `json:"c,omitempty"`
 }
 
 type ApiResponse struct {
@@ -112,7 +114,7 @@ func NewClient(address, privateKey string, logger *log.Logger) *Client {
 	}
 }
 
-func (c *Client) PlaceOrder(orderType, symbol, side string, size, price float64) (OpenOrderInfo, error) {
+func (c *Client) PlaceOrder(orderType, symbol, side string, size, price float64, reduceOnly bool) (OpenOrderInfo, error) {
 	assetID, ok := c.assetMap[strings.ToUpper(symbol)]
 	if !ok {
 		return OpenOrderInfo{}, fmt.Errorf("asset symbol not found: %s", symbol)
@@ -120,29 +122,47 @@ func (c *Client) PlaceOrder(orderType, symbol, side string, size, price float64)
 
 	isBuy := strings.ToLower(side) == "buy"
 
-	var orderTypeData OrderTypeData
-	switch orderType {
+	priceWire, err := floatToWire(price)
+	if err != nil {
+		return OpenOrderInfo{}, fmt.Errorf("failed to process price for wire format: %w", err)
+	}
+	sizeWire, err := floatToWire(size)
+	if err != nil {
+		return OpenOrderInfo{}, fmt.Errorf("failed to process size for wire format: %w", err)
+	}
+
+	var orderTypeData OrderType
+	switch strings.ToLower(orderType) {
 	case "limit":
-		orderTypeData.Limit = &LimitOrderType{Tif: "Gtc"}
+		orderTypeData.Limit = &LimitOrderType{Tif: string(TifGtc)}
 	case "market":
-		orderTypeData.Market = &MarketOrderType{Tif: "Ioc"}
+		tpsl := "sl"
+		if isBuy {
+			tpsl = "tp"
+		}
+		orderTypeData.Trigger = &TriggerOrderType{
+			TriggerPx: priceWire,
+			IsMarket:  true,
+			Tpsl:      tpsl,
+		}
 	default:
 		return OpenOrderInfo{}, fmt.Errorf("unsupported order type: %s", orderType)
 	}
 
-	orderPayload := OrderPayload{
-		Asset:      assetID,
-		IsBuy:      isBuy,
-		ReduceOnly: false,
-		LimitPx:    floatToString(price),
-		Sz:         floatToString(size),
-		OrderType:  orderTypeData,
+	orderRequest := internalOrderRequest{
+		Asset:         assetID,
+		IsBuy:         isBuy,
+		Price:         priceWire, // The trigger price is also used here for the order payload
+		Size:          sizeWire,
+		ReduceOnly:    reduceOnly,
+		OrderType:     orderTypeData,
+		ClientOrderID: nil,
 	}
 
-	action := PlaceOrderAction{
-		Type:     "order",
-		Orders:   []OrderPayload{orderPayload},
-		Grouping: "na",
+	action := map[string]any{
+		"type":     "order",
+		"orders":   []internalOrderRequest{orderRequest},
+		"grouping": GroupingNA,
 	}
 
 	respBytes, err := c.sendRequest(http.MethodPost, "exchange", action, true)
@@ -181,13 +201,11 @@ func (c *Client) PlaceOrder(orderType, symbol, side string, size, price float64)
 		statusInfo := status.(map[string]interface{})
 		oid := uint64(statusInfo["oid"].(float64))
 		return OpenOrderInfo{
-			Ts:         time.Now(),
-			Symbol:     symbol,
-			OrderType:  orderType,
-			OrderId:    strconv.FormatUint(oid, 10),
-			Size:       size,
-			OrderPrice: price,
-			Side:       side,
+			Ts:        time.Now(),
+			Symbol:    symbol,
+			OrderType: orderType,
+			OrderId:   strconv.FormatUint(oid, 10),
+			Side:      side,
 		}, nil
 	} else if errorMsg, ok := statusData["error"]; ok {
 		return OpenOrderInfo{}, fmt.Errorf("order placement error from API: %s", errorMsg.(string))
@@ -205,17 +223,17 @@ func (c *Client) newRequest(method, path string, payload interface{}, sign bool)
 		if sign {
 			nonce := time.Now().UnixMilli()
 
-			actionBytes, err := json.Marshal(payload)
-			if err != nil {
-				return nil, fmt.Errorf("failed to marshal action payload: %w", err)
-			}
+			hash := actionHash(payload, "", nonce, nil)
 
-			connectionID, err := c.createConnectionId(actionBytes, nonce)
-			if err != nil {
-				return nil, fmt.Errorf("failed to create connectionId: %w", err)
-			}
+			// 2. Construct the phantom agent for signing
+			phantomAgent := constructPhantomAgent(hash, true)
 
-			signature, err := c.signEIP712(connectionID)
+			// 3. Create the EIP-712 typed data payload
+			typedData := l1Payload(phantomAgent)
+
+			// 4. Sign the typed data
+			privateKey, err := PrivateKeyFromString(c.privateKey)
+			signature, err := signInner(privateKey, typedData)
 			if err != nil {
 				return nil, fmt.Errorf("failed to sign payload: %w", err)
 			}
@@ -284,87 +302,23 @@ func (c *Client) sendRequest(method, path string, data interface{}, sign bool) (
 	return response, nil
 }
 
-func (c *Client) createConnectionId(actionBytes []byte, nonce int64) (common.Hash, error) {
-	userAddress := common.HexToAddress(c.address)
+func floatToWire(x float64) (string, error) {
+	rounded := fmt.Sprintf("%.8f", x)
 
-	nonceBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(nonceBytes, uint64(nonce))
-
-	mainnetByte := []byte{1}
-
-	var packed []byte
-	packed = append(packed, userAddress.Bytes()...)
-	packed = append(packed, actionBytes...)
-	packed = append(packed, nonceBytes...)
-	packed = append(packed, mainnetByte...)
-
-	return crypto.Keccak256Hash(packed), nil
-}
-
-type Signature struct {
-	R string `json:"r"`
-	S string `json:"s"`
-	V uint8  `json:"v"`
-}
-
-func (c *Client) signEIP712(connectionID common.Hash) (Signature, error) {
-	privateKeyECDSA, err := crypto.HexToECDSA(strings.TrimPrefix(c.privateKey, "0x"))
+	parsed, err := strconv.ParseFloat(rounded, 64)
 	if err != nil {
-		return Signature{}, fmt.Errorf("failed to parse private key: %w", err)
+		return "", err
+	}
+	if math.Abs(parsed-x) >= 1e-9 {
+		return "", fmt.Errorf("float_to_wire causes rounding error: original %f, rounded %f", x, parsed)
 	}
 
-	typedData := apitypes.TypedData{
-		Types: apitypes.Types{
-			"EIP712Domain": []apitypes.Type{
-				{Name: "name", Type: "string"},
-				{Name: "version", Type: "string"},
-				{Name: "chainId", Type: "uint256"},
-				{Name: "verifyingContract", Type: "address"},
-			},
-			"Agent": []apitypes.Type{
-				{Name: "source", Type: "string"},
-				{Name: "connectionId", Type: "bytes32"},
-			},
-		},
-		PrimaryType: "Agent",
-		Domain: apitypes.TypedDataDomain{
-			Name:              "HyperliquidSigner",
-			Version:           "1",
-			ChainId:           math.NewHexOrDecimal256(42161),
-			VerifyingContract: "0x0000000000000000000000000000000000000000",
-		},
-		Message: apitypes.TypedDataMessage{
-			"source":       "a",
-			"connectionId": connectionID,
-		},
+	if rounded == "-0.00000000" {
+		rounded = "0.00000000"
 	}
 
-	domainSeparator, err := typedData.HashStruct("EIP712Domain", typedData.Domain.Map())
-	if err != nil {
-		return Signature{}, fmt.Errorf("failed to hash domain: %w", err)
-	}
+	result := strings.TrimRight(rounded, "0")
+	result = strings.TrimRight(result, ".")
 
-	typedDataHash, err := typedData.HashStruct(typedData.PrimaryType, typedData.Message)
-	if err != nil {
-		return Signature{}, fmt.Errorf("failed to hash message: %w", err)
-	}
-
-	challengeHash := crypto.Keccak256Hash(
-		[]byte("\x19\x01"),
-		domainSeparator,
-		typedDataHash,
-	)
-
-	signatureBytes, err := crypto.Sign(challengeHash.Bytes(), privateKeyECDSA)
-	if err != nil {
-		return Signature{}, fmt.Errorf("failed to sign: %w", err)
-	}
-
-	signatureBytes[64] += 27
-
-	return Signature{
-		R: hexutil.Encode(signatureBytes[0:32]),
-		S: hexutil.Encode(signatureBytes[32:64]),
-		V: signatureBytes[64],
-	}, nil
+	return result, nil
 }
