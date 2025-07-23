@@ -268,7 +268,6 @@ func (o *OrderBookBranch) handleMessage(msg []byte) error {
 
 	o.bufferLock.Unlock()
 	if o.snapshotReceived {
-		fmt.Println(o.getSides())
 		o.triggerCallback(data.Time)
 	}
 
