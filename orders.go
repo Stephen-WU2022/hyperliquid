@@ -52,17 +52,17 @@ type OrderTypeData struct {
 }
 
 type OrderPayload struct {
-	Asset      int           `json:"asset"`
-	IsBuy      bool          `json:"is_buy"`
-	LimitPx    string        `json:"limit_px"`
-	Sz         string        `json:"sz"`
-	ReduceOnly bool          `json:"reduce_only"`
-	OrderType  OrderTypeData `json:"order_type"`
+	Asset      int           `json:"a"`
+	IsBuy      bool          `json:"b"`
+	LimitPx    string        `json:"p"`
+	Sz         string        `json:"s"`
+	ReduceOnly bool          `json:"r"`
+	OrderType  OrderTypeData `json:"t"`
 }
 
 type ApiResponse struct {
-	Status   string       `json:"status"`
-	Response ResponseData `json:"response"`
+	Status   string          `json:"status"`
+	Response json.RawMessage `json:"response"`
 }
 
 type ResponseData struct {
@@ -71,7 +71,7 @@ type ResponseData struct {
 }
 
 type StatusWrapper struct {
-	Statuses []map[string]StatusDetail `json:"statuses"`
+	Statuses []json.RawMessage `json:"statuses"`
 }
 
 type StatusDetail struct {
@@ -87,6 +87,16 @@ type Client struct {
 	cancel      context.CancelFunc
 	rateLimiter <-chan time.Time
 	assetMap    map[string]int
+}
+
+func floatToString(f float64) string {
+	// Format with 'f' and a high precision to prevent scientific notation.
+	s := strconv.FormatFloat(f, 'f', 10, 64)
+	// Remove trailing zeros.
+	s = strings.TrimRight(s, "0")
+	// If the last character is a dot, remove it.
+	s = strings.TrimSuffix(s, ".")
+	return s
 }
 
 func NewClient(address, privateKey string, logger *log.Logger) *Client {
@@ -109,7 +119,7 @@ func (c *Client) PlaceOrder(orderType, symbol, side string, size, price float64)
 		return OpenOrderInfo{}, fmt.Errorf("asset symbol not found: %s", symbol)
 	}
 
-	isBuy := side == "buy"
+	isBuy := strings.ToLower(side) == "buy"
 
 	var orderTypeData OrderTypeData
 	switch orderType {
@@ -125,8 +135,8 @@ func (c *Client) PlaceOrder(orderType, symbol, side string, size, price float64)
 		Asset:      assetID,
 		IsBuy:      isBuy,
 		ReduceOnly: false,
-		LimitPx:    strconv.FormatFloat(price, 'f', -1, 64),
-		Sz:         strconv.FormatFloat(size, 'f', -1, 64),
+		LimitPx:    floatToString(price),
+		Sz:         floatToString(size),
 		OrderType:  orderTypeData,
 	}
 
@@ -141,32 +151,55 @@ func (c *Client) PlaceOrder(orderType, symbol, side string, size, price float64)
 		return OpenOrderInfo{}, err
 	}
 
+	// First, unmarshal into the flexible ApiResponse struct.
 	var apiResponse ApiResponse
 	if err := json.Unmarshal(respBytes, &apiResponse); err != nil {
-		return OpenOrderInfo{}, fmt.Errorf("failed to unmarshal api response: %w", err)
+		return OpenOrderInfo{}, fmt.Errorf("failed to unmarshal initial api response: %w", err)
 	}
 
+	// If the status is not "ok", the 'Response' field contains an error string.
 	if apiResponse.Status != "ok" {
-		return OpenOrderInfo{}, fmt.Errorf("order placement failed with status: %s", apiResponse.Status)
+		var errorString string
+		// Attempt to unmarshal the 'Response' field as a simple string.
+		if err := json.Unmarshal(apiResponse.Response, &errorString); err == nil {
+			return OpenOrderInfo{}, fmt.Errorf("order placement failed with status '%s': %s", apiResponse.Status, errorString)
+		}
+		// If that fails, just return the raw response.
+		return OpenOrderInfo{}, fmt.Errorf("order placement failed with status '%s' and unparseable error response: %s", apiResponse.Status, string(apiResponse.Response))
 	}
 
-	if len(apiResponse.Response.Data.Statuses) == 0 {
+	// If status is "ok", then we can unmarshal the 'Response' field into the expected ResponseData struct.
+	var responseData ResponseData
+	if err := json.Unmarshal(apiResponse.Response, &responseData); err != nil {
+		return OpenOrderInfo{}, fmt.Errorf("failed to unmarshal successful response data: %w", err)
+	}
+
+	if len(responseData.Data.Statuses) == 0 {
 		return OpenOrderInfo{}, errors.New("no order status returned")
 	}
 
-	statusMap := apiResponse.Response.Data.Statuses[0]
-	var oid uint64
-	oid = statusMap["oid"].Oid
+	var statusData map[string]interface{}
+	if err := json.Unmarshal(responseData.Data.Statuses[0], &statusData); err != nil {
+		return OpenOrderInfo{}, fmt.Errorf("failed to unmarshal order status: %w", err)
+	}
 
-	return OpenOrderInfo{
-		Ts:         time.Now(),
-		Symbol:     symbol,
-		OrderType:  orderType,
-		OrderId:    strconv.FormatUint(oid, 10),
-		Size:       size,
-		OrderPrice: price,
-		Side:       side,
-	}, nil
+	if status, ok := statusData["resting"]; ok {
+		statusInfo := status.(map[string]interface{})
+		oid := uint64(statusInfo["oid"].(float64))
+		return OpenOrderInfo{
+			Ts:         time.Now(),
+			Symbol:     symbol,
+			OrderType:  orderType,
+			OrderId:    strconv.FormatUint(oid, 10),
+			Size:       size,
+			OrderPrice: price,
+			Side:       side,
+		}, nil
+	} else if errorMsg, ok := statusData["error"]; ok {
+		return OpenOrderInfo{}, fmt.Errorf("order placement error from API: %s", errorMsg.(string))
+	}
+
+	return OpenOrderInfo{}, errors.New("unknown order status returned in response")
 }
 
 func (c *Client) newRequest(method, path string, payload interface{}, sign bool) (*http.Request, error) {
@@ -174,40 +207,48 @@ func (c *Client) newRequest(method, path string, payload interface{}, sign bool)
 	var reqBodyBytes []byte
 	var err error
 
-	if sign {
-		nonce := time.Now().UnixMilli()
-		actionBytes, err := json.Marshal(payload)
-		if err != nil {
-			return nil, err
-		}
+	if payload != nil {
+		if sign {
+			nonce := time.Now().UnixMilli()
 
-		connectionID, err := c.createConnectionId(actionBytes, nonce)
-		if err != nil {
-			return nil, err
-		}
+			// --- CHANGE #2: Use json.Marshal for robust, newline-free marshalling ---
+			// This matches the go-sdk's implementation.
+			actionBytes, err := json.Marshal(payload)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal action payload: %w", err)
+			}
 
-		signature, err := c.signEIP712(connectionID)
-		if err != nil {
-			return nil, err
-		}
+			connectionID, err := c.createConnectionId(actionBytes, nonce)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create connectionId: %w", err)
+			}
 
-		signedPayload := map[string]interface{}{
-			"action":    payload,
-			"nonce":     nonce,
-			"signature": signature,
-		}
-		reqBodyBytes, err = json.Marshal(signedPayload)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		reqBodyBytes, err = json.Marshal(payload)
-		if err != nil {
-			return nil, err
+			signature, err := c.signEIP712(connectionID)
+			if err != nil {
+				return nil, fmt.Errorf("failed to sign payload: %w", err)
+			}
+
+			signedPayload := map[string]interface{}{
+				"action":    payload,
+				"nonce":     nonce,
+				"signature": signature,
+			}
+			reqBodyBytes, err = json.Marshal(signedPayload)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal signed payload: %w", err)
+			}
+		} else {
+			reqBodyBytes, err = json.Marshal(payload)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal non-signed payload: %w", err)
+			}
 		}
 	}
 
-	body = bytes.NewBuffer(reqBodyBytes)
+	if reqBodyBytes != nil {
+		body = bytes.NewBuffer(reqBodyBytes)
+	}
+
 	url := fmt.Sprintf("%s/%s", ExchangeEndpoint, path)
 	req, err := http.NewRequest(method, url, body)
 	if err != nil {
@@ -215,8 +256,6 @@ func (c *Client) newRequest(method, path string, payload interface{}, sign bool)
 	}
 
 	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("Accept", "application/json")
-
 	return req, nil
 }
 
@@ -321,7 +360,7 @@ func (c *Client) signEIP712(connectionID common.Hash) (Signature, error) {
 			VerifyingContract: "0x0000000000000000000000000000000000000000",
 		},
 		Message: apitypes.TypedDataMessage{
-			"source":       "https://hyperliquid.xyz",
+			"source":       "a",
 			"connectionId": connectionID,
 		},
 	}
