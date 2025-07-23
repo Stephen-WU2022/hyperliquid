@@ -67,7 +67,6 @@ func actionHash(action any, vaultAddress string, nonce int64, expiresAfter *int6
 
 	// Return keccak256 hash
 	hash := crypto.Keccak256(data)
-	fmt.Printf("go action hash: %s\n", hex.EncodeToString(hash))
 	return hash
 }
 
@@ -77,7 +76,7 @@ func constructPhantomAgent(hash []byte, isMainnet bool) map[string]any {
 	if isMainnet {
 		source = "a" // mainnet
 	}
-	
+
 	return map[string]any{
 		"source":       source,
 		"connectionId": hash,
@@ -86,7 +85,7 @@ func constructPhantomAgent(hash []byte, isMainnet bool) map[string]any {
 
 // l1Payload implements the same logic as Python's l1_payload
 func l1Payload(phantomAgent map[string]any) apitypes.TypedData {
-	chainId := math.HexOrDecimal256(*big.NewInt(42161))
+	chainId := math.HexOrDecimal256(*big.NewInt(1337))
 	return apitypes.TypedData{
 		Domain: apitypes.TypedDataDomain{
 			ChainId:           &chainId,
@@ -95,15 +94,15 @@ func l1Payload(phantomAgent map[string]any) apitypes.TypedData {
 			VerifyingContract: "0x0000000000000000000000000000000000000000",
 		},
 		Types: apitypes.Types{
-			"Agent": []apitypes.Type{
-				{Name: "source", Type: "string"},
-				{Name: "connectionId", Type: "bytes32"},
-			},
 			"EIP712Domain": []apitypes.Type{
 				{Name: "name", Type: "string"},
 				{Name: "version", Type: "string"},
 				{Name: "chainId", Type: "uint256"},
 				{Name: "verifyingContract", Type: "address"},
+			},
+			"Agent": []apitypes.Type{
+				{Name: "source", Type: "string"},
+				{Name: "connectionId", Type: "bytes32"},
 			},
 		},
 		PrimaryType: "Agent",
