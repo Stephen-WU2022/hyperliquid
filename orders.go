@@ -3,10 +3,10 @@ package hyperliquid
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common/math"
 	"io"
 	"net/http"
@@ -33,9 +33,9 @@ const (
 )
 
 type PlaceOrderAction struct {
-	Type     string         `json:"type"`
-	Orders   []OrderPayload `json:"orders"`
 	Grouping string         `json:"grouping"`
+	Orders   []OrderPayload `json:"orders"`
+	Type     string         `json:"type"`
 }
 
 type LimitOrderType struct {
@@ -55,8 +55,8 @@ type OrderPayload struct {
 	Asset      int           `json:"a"`
 	IsBuy      bool          `json:"b"`
 	LimitPx    string        `json:"p"`
-	Sz         string        `json:"s"`
-	ReduceOnly bool          `json:"r"`
+	ReduceOnly bool          `json:"r"` // Moved up
+	Sz         string        `json:"s"` // Moved down
 	OrderType  OrderTypeData `json:"t"`
 }
 
@@ -90,12 +90,11 @@ type Client struct {
 }
 
 func floatToString(f float64) string {
-	// Format with 'f' and a high precision to prevent scientific notation.
-	s := strconv.FormatFloat(f, 'f', 10, 64)
-	// Remove trailing zeros.
+	s := strconv.FormatFloat(f, 'f', 15, 64)
 	s = strings.TrimRight(s, "0")
-	// If the last character is a dot, remove it.
-	s = strings.TrimSuffix(s, ".")
+	if s[len(s)-1] == '.' {
+		return s + "0"
+	}
 	return s
 }
 
@@ -151,24 +150,19 @@ func (c *Client) PlaceOrder(orderType, symbol, side string, size, price float64)
 		return OpenOrderInfo{}, err
 	}
 
-	// First, unmarshal into the flexible ApiResponse struct.
 	var apiResponse ApiResponse
 	if err := json.Unmarshal(respBytes, &apiResponse); err != nil {
 		return OpenOrderInfo{}, fmt.Errorf("failed to unmarshal initial api response: %w", err)
 	}
 
-	// If the status is not "ok", the 'Response' field contains an error string.
 	if apiResponse.Status != "ok" {
 		var errorString string
-		// Attempt to unmarshal the 'Response' field as a simple string.
 		if err := json.Unmarshal(apiResponse.Response, &errorString); err == nil {
 			return OpenOrderInfo{}, fmt.Errorf("order placement failed with status '%s': %s", apiResponse.Status, errorString)
 		}
-		// If that fails, just return the raw response.
 		return OpenOrderInfo{}, fmt.Errorf("order placement failed with status '%s' and unparseable error response: %s", apiResponse.Status, string(apiResponse.Response))
 	}
 
-	// If status is "ok", then we can unmarshal the 'Response' field into the expected ResponseData struct.
 	var responseData ResponseData
 	if err := json.Unmarshal(apiResponse.Response, &responseData); err != nil {
 		return OpenOrderInfo{}, fmt.Errorf("failed to unmarshal successful response data: %w", err)
@@ -211,8 +205,6 @@ func (c *Client) newRequest(method, path string, payload interface{}, sign bool)
 		if sign {
 			nonce := time.Now().UnixMilli()
 
-			// --- CHANGE #2: Use json.Marshal for robust, newline-free marshalling ---
-			// This matches the go-sdk's implementation.
 			actionBytes, err := json.Marshal(payload)
 			if err != nil {
 				return nil, fmt.Errorf("failed to marshal action payload: %w", err)
@@ -293,36 +285,18 @@ func (c *Client) sendRequest(method, path string, data interface{}, sign bool) (
 }
 
 func (c *Client) createConnectionId(actionBytes []byte, nonce int64) (common.Hash, error) {
-	// The order of arguments and types MUST match the server's expectation.
-	// The expected order is: address, string, uint64
-	addressArgument, err := abi.NewType("address", "", nil)
-	if err != nil {
-		return common.Hash{}, err
-	}
-	stringArgument, err := abi.NewType("string", "", nil)
-	if err != nil {
-		return common.Hash{}, err
-	}
-	uint64Argument, err := abi.NewType("uint64", "", nil)
-	if err != nil {
-		return common.Hash{}, err
-	}
-
-	// Define the arguments in the correct order
-	arguments := abi.Arguments{
-		{Type: addressArgument},
-		{Type: stringArgument},
-		{Type: uint64Argument},
-	}
-
-	// Convert the client's hex address string to a common.Address type
 	userAddress := common.HexToAddress(c.address)
 
-	// Pack the arguments in the correct order: your address, the action, and the nonce.
-	packed, err := arguments.Pack(userAddress, string(actionBytes), uint64(nonce))
-	if err != nil {
-		return common.Hash{}, err
-	}
+	nonceBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(nonceBytes, uint64(nonce))
+
+	mainnetByte := []byte{1}
+
+	var packed []byte
+	packed = append(packed, userAddress.Bytes()...)
+	packed = append(packed, actionBytes...)
+	packed = append(packed, nonceBytes...)
+	packed = append(packed, mainnetByte...)
 
 	return crypto.Keccak256Hash(packed), nil
 }
@@ -356,7 +330,7 @@ func (c *Client) signEIP712(connectionID common.Hash) (Signature, error) {
 		Domain: apitypes.TypedDataDomain{
 			Name:              "HyperliquidSigner",
 			Version:           "1",
-			ChainId:           math.NewHexOrDecimal256(1337),
+			ChainId:           math.NewHexOrDecimal256(42161),
 			VerifyingContract: "0x0000000000000000000000000000000000000000",
 		},
 		Message: apitypes.TypedDataMessage{
@@ -375,8 +349,6 @@ func (c *Client) signEIP712(connectionID common.Hash) (Signature, error) {
 		return Signature{}, fmt.Errorf("failed to hash message: %w", err)
 	}
 
-	// CORRECTED HASHING:
-	// The crypto.Keccak256Hash function will concatenate the arguments correctly.
 	challengeHash := crypto.Keccak256Hash(
 		[]byte("\x19\x01"),
 		domainSeparator,
@@ -388,11 +360,8 @@ func (c *Client) signEIP712(connectionID common.Hash) (Signature, error) {
 		return Signature{}, fmt.Errorf("failed to sign: %w", err)
 	}
 
-	// The API expects the old standard of V being 27 or 28.
 	signatureBytes[64] += 27
 
-	// CORRECTED RETURN TYPE:
-	// Populate and return the Signature struct.
 	return Signature{
 		R: hexutil.Encode(signatureBytes[0:32]),
 		S: hexutil.Encode(signatureBytes[32:64]),
