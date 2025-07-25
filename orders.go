@@ -53,13 +53,13 @@ type TriggerOrderType struct {
 }
 
 type internalOrderRequest struct {
-	Asset         int       `json:"a"`
-	IsBuy         bool      `json:"b"`
-	Price         string    `json:"p"`
-	Size          string    `json:"s"`
-	ReduceOnly    bool      `json:"r"`
-	OrderType     OrderType `json:"t"`
-	ClientOrderID *string   `json:"c,omitempty"`
+	Asset         int       `json:"a" msgpack:"a"`
+	IsBuy         bool      `json:"b" msgpack:"b"`
+	Price         string    `json:"p" msgpack:"p"`
+	Size          string    `json:"s" msgpack:"s"`
+	ReduceOnly    bool      `json:"r" msgpack:"r"`
+	OrderType     OrderType `json:"t" msgpack:"t"`
+	ClientOrderID *string   `json:"c,omitempty" msgpack:"c,omitempty"`
 }
 
 type ApiResponse struct {
@@ -80,6 +80,11 @@ type StatusDetail struct {
 	Oid uint64 `json:"oid"`
 }
 
+type OrderAction struct {
+	Type     string                 `msgpack:"type" json:"type"`
+	Orders   []internalOrderRequest `msgpack:"orders" json:"orders"`
+	Grouping string                 `msgpack:"grouping" json:"grouping"`
+}
 type Client struct {
 	address     string
 	privateKey  string
@@ -158,11 +163,10 @@ func (c *Client) PlaceOrder(orderType, symbol, side string, size, price float64,
 		OrderType:     orderTypeData,
 		ClientOrderID: nil,
 	}
-
-	action := map[string]any{
-		"type":     "order",
-		"orders":   []internalOrderRequest{orderRequest},
-		"grouping": GroupingNA,
+	action := OrderAction{
+		Type:     "order",
+		Orders:   []internalOrderRequest{orderRequest},
+		Grouping: GroupingNA,
 	}
 
 	respBytes, err := c.sendRequest(http.MethodPost, "exchange", action, true)

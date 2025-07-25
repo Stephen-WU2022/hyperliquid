@@ -6,11 +6,11 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"github.com/ethereum/go-ethereum/common"
 	"math/big"
 	"strings"
 	"time"
 
-	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/signer/core/apitypes"
@@ -30,7 +30,6 @@ func actionHash(action any, vaultAddress string, nonce int64, expiresAfter *int6
 	// Pack action using msgpack (like Python's msgpack.packb)
 	var buf bytes.Buffer
 	enc := msgpack.NewEncoder(&buf)
-	enc.SetSortMapKeys(true)
 
 	err := enc.Encode(action)
 	if err != nil {
@@ -121,37 +120,35 @@ type SignatureResult struct {
 func signInner(
 	privateKey *ecdsa.PrivateKey,
 	typedData apitypes.TypedData,
-) (SignatureResult, error) {
+) (map[string]interface{}, error) {
 	// Create EIP-712 hash
 	domainSeparator, err := typedData.HashStruct("EIP712Domain", typedData.Domain.Map())
 	if err != nil {
-		return SignatureResult{}, fmt.Errorf("failed to hash domain: %w", err)
+		return nil, fmt.Errorf("failed to hash domain: %w", err)
 	}
 
 	typedDataHash, err := typedData.HashStruct(typedData.PrimaryType, typedData.Message)
 	if err != nil {
-		return SignatureResult{}, fmt.Errorf("failed to hash typed data: %w", err)
+		return nil, fmt.Errorf("failed to hash typed data: %w", err)
 	}
 
-	rawData := []byte{0x19, 0x01}
-	rawData = append(rawData, domainSeparator...)
-	rawData = append(rawData, typedDataHash...)
-	msgHash := crypto.Keccak256Hash(rawData)
+	hashInput := []byte(fmt.Sprintf("\x19\x01%s%s", string(domainSeparator), string(typedDataHash)))
+	finalHash := crypto.Keccak256(hashInput)
 
-	signature, err := crypto.Sign(msgHash.Bytes(), privateKey)
+	signature, err := crypto.Sign(finalHash, privateKey)
 	if err != nil {
-		return SignatureResult{}, fmt.Errorf("failed to sign message: %w", err)
+		return nil, fmt.Errorf("failed to sign message: %w", err)
 	}
 
 	// Extract r, s, v components
-	r := new(big.Int).SetBytes(signature[:32])
-	s := new(big.Int).SetBytes(signature[32:64])
-	v := int(signature[64]) + 27
+	r := signature[:32]
+	s := signature[32:64]
+	v := signature[64] + 27
 
-	return SignatureResult{
-		R: hexutil.EncodeBig(r),
-		S: hexutil.EncodeBig(s),
-		V: v,
+	return map[string]interface{}{
+		"r": common.Bytes2Hex(r),
+		"s": common.Bytes2Hex(s),
+		"v": v,
 	}, nil
 }
 
@@ -182,7 +179,7 @@ func SignL1Action(
 	timestamp int64,
 	expiresAfter *int64,
 	isMainnet bool,
-) (SignatureResult, error) {
+) (map[string]interface{}, error) {
 	// Step 1: Create action hash
 	hash := actionHash(action, vaultAddress, timestamp, expiresAfter)
 
